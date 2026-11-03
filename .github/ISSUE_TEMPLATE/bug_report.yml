@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in the player does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Never attach games, BIOS files, console keys or commercial save files.**
+        Engine bugs that also happen outside EmuHall belong to the engine's own project.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Player version or commit
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and version
+      placeholder: e.g. mGBA 0.10.5
+  - type: input
+    id: system
+    attributes:
+      label: OS, CPU and GPU
+      placeholder: e.g. Windows 11 23H2, Ryzen 5 5600, RTX 3060
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Player log
+      description: The player's stderr output. Remove paths you consider private.
+      render: text
+  - type: checkboxes
+    id: content
+    attributes:
+      label: Content
+      options:
+        - label: This report contains no game files, BIOS files, keys or commercial save data.
+          required: true

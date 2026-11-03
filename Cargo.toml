@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/emuhall-player-runtime", "crates/emuhall-core-host"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
