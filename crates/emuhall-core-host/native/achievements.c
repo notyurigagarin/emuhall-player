@@ -135,7 +135,7 @@ static DWORD WINAPI badge_thread(LPVOID param){
     if(MultiByteToWideChar(CP_UTF8,0,job->url,-1,url,1200)&&WinHttpCrackUrl(url,0,0,&parts)&&parts.nScheme==INTERNET_SCHEME_HTTPS&&parts.nPort==443){
         host[parts.dwHostNameLength]=0;path[parts.dwUrlPathLength]=0;
         if(_wcsicmp(host,L"media.retroachievements.org")&&_wcsicmp(host,L"retroachievements.org"))goto done;
-        session=WinHttpOpen(L"EmuHall/1.0.1",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+        session=WinHttpOpen(L"EmuHall/1.0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
         if(session){WinHttpSetTimeouts(session,3000,3000,3000,3000);connection=WinHttpConnect(session,host,443,0);}
         if(connection)request=WinHttpOpenRequest(connection,L"GET",path,NULL,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE);
         if(request){
@@ -558,7 +558,7 @@ int eh_ra_start(const char *args,const char *path,const void *data,size_t size,v
     char clause[64]="";rc_client_get_user_agent_clause(client,clause,sizeof(clause));
     char os[48];os_clause(os,sizeof(os));
     /* RetroAchievements' format: EmulatorName/version (OS version) core/version, then the rcheevos clause. */
-    snprintf(user_agent,sizeof(user_agent),"EmuHall/1.0.1 (%s) %s %s",os,core_clause[0]?core_clause:"unknown/0",clause);
+    snprintf(user_agent,sizeof(user_agent),"EmuHall/1.0.2 (%s) %s %s",os,core_clause[0]?core_clause:"unknown/0",clause);
     rc_client_set_event_handler(client,on_event);
     rc_client_set_allow_background_memory_reads(client,0); /* Memory is read only between frames, on this thread. */
     rc_client_set_hardcore_enabled(client,hardcore);
