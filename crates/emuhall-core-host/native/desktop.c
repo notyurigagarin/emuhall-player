@@ -1,6 +1,10 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 /* Portable SDL3 desktop surface. The worker owns SDL and all callbacks stay on
    its main thread. The proven Win32 presenter remains the Windows default. */
 #include "desktop.h"
+#include "achievements.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,11 +17,25 @@ static void *symbol(void *lib,const char *name){FARPROC f=GetProcAddress((HMODUL
 static void close_library(void *lib){FreeLibrary((HMODULE)lib);}
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 static void *open_library(void){
 #ifdef __APPLE__
     void *lib=dlopen("@executable_path/libSDL3.dylib",RTLD_NOW|RTLD_LOCAL);if(!lib)lib=dlopen("libSDL3.dylib",RTLD_NOW|RTLD_LOCAL);
 #else
-    void *lib=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL);if(!lib)lib=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL);
+    /* The bundled SDL is looked up beside the player first, by absolute path: AppImage tooling rewrites the player's
+       library search path, so the build's rpath cannot be relied on. Portable folder: beside the player. Packages
+       (.deb, .rpm, AppImage): ../lib/EmuHall. A system SDL3 is the last resort. */
+    void *lib=NULL;char exe[4096];ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
+    if(n>0){
+        exe[n]=0;char *slash=strrchr(exe,'/');
+        if(slash){
+            *slash=0;const char *places[]={"%s/libSDL3.so.0","%s/../lib/EmuHall/libSDL3.so.0","%s/../lib/libSDL3.so.0"};
+            for(unsigned i=0;i<sizeof(places)/sizeof(places[0])&&!lib;i++){char path[4200];snprintf(path,sizeof(path),places[i],exe);lib=dlopen(path,RTLD_NOW|RTLD_LOCAL);}
+        }
+    }
+    if(!lib)lib=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL);
+    if(!lib)lib=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL);
+    if(!lib)fprintf(stderr,"SDL3 could not be loaded: %s\n",dlerror());
 #endif
     return lib;
 }
@@ -45,7 +63,8 @@ static void close_library(void *lib){dlclose(lib);}
  X(int,SDL_GetAudioStreamQueued,(SDL_AudioStream*)) X(bool,SDL_PutAudioStreamData,(SDL_AudioStream*,const void*,int)) \
  X(bool,SDL_GL_SetAttribute,(SDL_GLAttr,int)) X(SDL_GLContext,SDL_GL_CreateContext,(SDL_Window*)) \
  X(SDL_Window*,SDL_GL_GetCurrentWindow,(void)) X(SDL_GLContext,SDL_GL_GetCurrentContext,(void)) \
- X(bool,SDL_GL_MakeCurrent,(SDL_Window*,SDL_GLContext)) X(bool,SDL_GL_DestroyContext,(SDL_GLContext)) X(SDL_FunctionPointer,SDL_GL_GetProcAddress,(const char*))
+ X(bool,SDL_GL_MakeCurrent,(SDL_Window*,SDL_GLContext)) X(bool,SDL_GL_DestroyContext,(SDL_GLContext)) X(SDL_FunctionPointer,SDL_GL_GetProcAddress,(const char*)) \
+ X(bool,SDL_SetHint,(const char*,const char*))
 #define DECLARE(ret,name,args) static ret (SDLCALL *p_##name)args;
 FUNCTIONS(DECLARE)
 static void *library;static int video_ready,audio_ready,fullscreen;
@@ -60,7 +79,21 @@ static int ensure(void){
     FUNCTIONS(LOAD)
     if(!ok){close_library(library);library=NULL;fprintf(stderr,"SDL3 runtime is too old or incomplete\n");return 0;}return 1;
 }
-static int video_init(void){if(!ensure())return 0;if(!video_ready){p_SDL_SetMainReady();p_SDL_SetAppMetadata("EmuHall","0.1.0-dev","dev.emuhall.player");if(!p_SDL_InitSubSystem(SDL_INIT_VIDEO))return 0;video_ready=1;}return 1;}
+/* Linux: OpenGL contexts through EGL, on X11 too (SDL would use GLX there). Engines that render on a context shared with
+   ours find it through EGL first: the PS2 engine's capture loads EGL from the current display and, with a GLX context
+   current, called an EGL 1.4 entry point it had not loaded and crashed. */
+static int video_init(void){
+    if(!ensure())return 0;
+    if(!video_ready){
+        p_SDL_SetMainReady();p_SDL_SetAppMetadata("EmuHall","0.1.0-dev","dev.emuhall.player");
+#if !defined(_WIN32)&&!defined(__APPLE__)
+        p_SDL_SetHint("SDL_VIDEO_FORCE_EGL","1");
+#endif
+        if(!p_SDL_InitSubSystem(SDL_INIT_VIDEO))return 0;
+        video_ready=1;
+    }
+    return 1;
+}
 double eh_desktop_now(void){return ensure()?p_SDL_GetTicksNS()/1000000.0:0;}
 int eh_desktop_open(double rate,int hidden){
     if(!video_init())return 0;
@@ -121,6 +154,41 @@ int16_t eh_desktop_pointer(unsigned id){
     if(!inside)return -32768;
     return id==0?(int16_t)(x*65534/picture.w-32767):id==1?(int16_t)(y*65534/picture.h-32767):0;
 }
+/* RetroAchievements pop-up (game identified, achievement unlocked, game mastered) for the SDL presenter, the
+   counterpart of the Windows GDI overlay. SDL's built-in debug font draws ASCII; other characters show as '?'. */
+static SDL_Texture *badge_texture;
+static void fit_text(char *out,size_t cap,const char *text,float width){
+    size_t limit=width>8?(size_t)(width/8):0;if(limit>=cap)limit=cap-1;
+    size_t n=strlen(text);if(n<=limit){snprintf(out,cap,"%s",text);return;}
+    if(limit<4){out[0]=0;return;}
+    memcpy(out,text,limit-3);memcpy(out+limit-3,"...",4);
+}
+static void draw_achievement_notice(void){
+    static eh_ra_notification_t notice;
+    if(!eh_ra_notification(&notice))return;
+    float scale=output_w>=1000?2.0f:output_w>=560?1.5f:1.0f;
+    float width=fminf(360,(float)output_w/scale-24),height=56,x=((float)output_w/scale-width)/2,y=14;
+    if(width<120)return;
+    p_SDL_SetRenderScale(renderer,scale,scale);
+    SDL_FRect card={x,y,width,height},edge={x,y,3,height};
+    p_SDL_SetRenderDrawColor(renderer,10,22,38,255);p_SDL_RenderFillRect(renderer,&card);
+    if(notice.hardcore)p_SDL_SetRenderDrawColor(renderer,232,184,92,255);else p_SDL_SetRenderDrawColor(renderer,64,183,232,255);
+    p_SDL_RenderFillRect(renderer,&edge);
+    float text_x=x+14;
+    if(notice.badge_ready){
+        if(!badge_texture)badge_texture=p_SDL_CreateTexture(renderer,SDL_PIXELFORMAT_XRGB8888,SDL_TEXTUREACCESS_STREAMING,EH_RA_BADGE_SIZE,EH_RA_BADGE_SIZE);
+        if(badge_texture&&p_SDL_UpdateTexture(badge_texture,NULL,notice.badge_pixels,EH_RA_BADGE_SIZE*4)){
+            p_SDL_SetTextureScaleMode(badge_texture,SDL_SCALEMODE_LINEAR);
+            SDL_FRect badge={x+10,y+8,40,40};p_SDL_RenderTexture(renderer,badge_texture,NULL,&badge);text_x=x+60;
+        }
+    }
+    char line[96];float room=x+width-10-text_x;
+    const char *label=notice.kind==2?"Achievement unlocked":notice.kind==3?"Game mastered":"RetroAchievements";
+    fit_text(line,sizeof(line),label,room);p_SDL_SetRenderDrawColor(renderer,140,190,232,255);p_SDL_RenderDebugText(renderer,text_x,y+10,line);
+    fit_text(line,sizeof(line),notice.heading,room);p_SDL_SetRenderDrawColor(renderer,236,243,252,255);p_SDL_RenderDebugText(renderer,text_x,y+24,line);
+    fit_text(line,sizeof(line),notice.detail,room);p_SDL_SetRenderDrawColor(renderer,170,186,206,255);p_SDL_RenderDebugText(renderer,text_x,y+38,line);
+    p_SDL_SetRenderScale(renderer,1,1);
+}
 int eh_desktop_video(const uint32_t *pixels,unsigned w,unsigned h,int integer,int smooth){
     if(!renderer||!pixels||!w||!h||w>4096||h>4096)return 0;
     if(w!=texture_w||h!=texture_h){if(texture)p_SDL_DestroyTexture(texture);texture=p_SDL_CreateTexture(renderer,SDL_PIXELFORMAT_XRGB8888,SDL_TEXTUREACCESS_STREAMING,(int)w,(int)h);texture_w=w;texture_h=h;}
@@ -141,6 +209,7 @@ int eh_desktop_video(const uint32_t *pixels,unsigned w,unsigned h,int integer,in
         p_SDL_SetRenderScale(renderer,1,1);
     }
     extern int eh_fps_overlay(void);int measured=eh_fps_overlay();if(measured>=0){char label[40];snprintf(label,sizeof(label),"%.1f FPS",measured/1000.0);SDL_FRect card={(float)output_w-112,16,96,28};p_SDL_SetRenderDrawColor(renderer,8,18,32,255);p_SDL_RenderFillRect(renderer,&card);p_SDL_SetRenderDrawColor(renderer,225,241,255,255);p_SDL_RenderDebugText(renderer,card.x+8,card.y+9,label);}
+    draw_achievement_notice();
     ok=ok&&p_SDL_RenderPresent(renderer);
     if(gl_context)p_SDL_GL_MakeCurrent(gl_window,gl_context);
     return ok;
@@ -175,6 +244,7 @@ void eh_desktop_gl_close(void){if(gl_context)p_SDL_GL_DestroyContext(gl_context)
 void eh_desktop_close(void){
     if(audio){p_SDL_DestroyAudioStream(audio);}audio=NULL;
     if(texture){p_SDL_DestroyTexture(texture);}texture=NULL;
+    if(badge_texture){p_SDL_DestroyTexture(badge_texture);}badge_texture=NULL;
     if(renderer){p_SDL_DestroyRenderer(renderer);}renderer=NULL;
     if(window){p_SDL_DestroyWindow(window);}window=NULL;
     if(audio_ready){p_SDL_QuitSubSystem(SDL_INIT_AUDIO);}

@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 /* RetroAchievements inside the playback worker, through the official rcheevos client (third-party/rcheevos).
    The launcher signs in (it holds the token) and passes the session here with an "ra-login" command; this file
    identifies the game with RetroAchievements' own hashing, reads emulated memory through the core's libretro
@@ -19,6 +22,15 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <wincodec.h>
+#else
+#include <pthread.h>
+#include <sys/utsname.h>
+/* Provided by the player's Rust side (src/http.rs): each request runs on its own thread and calls back from it,
+   as WinHTTP does on Windows. Both return 0, without calling back, when nothing could be started. */
+typedef void (*eh_http_done)(int status,const char *body,size_t length,void *context);
+int eh_http_request(const char *url,const char *post,const char *content_type,const char *user_agent,size_t limit,eh_http_done done,void *context);
+typedef void (*eh_badge_done)(const uint32_t *pixels,void *context);
+int eh_badge_fetch(const char *url,unsigned size,eh_badge_done done,void *context);
 #endif
 
 /* Provided by host.c. */
@@ -63,14 +75,22 @@ static unsigned tracked_id;
 static unsigned long long tracked_checked_ms;
 static char tracked_json[7200];
 
+#ifndef _WIN32
+/* Badge downloads finish on their own threads, while the presenter reads the overlay state. */
+static pthread_mutex_t overlay_mutex=PTHREAD_MUTEX_INITIALIZER;
+#endif
 static void overlay_lock(void){
 #ifdef _WIN32
     EnterCriticalSection(&toast_lock);
+#else
+    pthread_mutex_lock(&overlay_mutex);
 #endif
 }
 static void overlay_unlock(void){
 #ifdef _WIN32
     LeaveCriticalSection(&toast_lock);
+#else
+    pthread_mutex_unlock(&overlay_mutex);
 #endif
 }
 
@@ -135,7 +155,7 @@ static DWORD WINAPI badge_thread(LPVOID param){
     if(MultiByteToWideChar(CP_UTF8,0,job->url,-1,url,1200)&&WinHttpCrackUrl(url,0,0,&parts)&&parts.nScheme==INTERNET_SCHEME_HTTPS&&parts.nPort==443){
         host[parts.dwHostNameLength]=0;path[parts.dwUrlPathLength]=0;
         if(_wcsicmp(host,L"media.retroachievements.org")&&_wcsicmp(host,L"retroachievements.org"))goto done;
-        session=WinHttpOpen(L"EmuHall/1.0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+        session=WinHttpOpen(L"EmuHall/1.1.0",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
         if(session){WinHttpSetTimeouts(session,3000,3000,3000,3000);connection=WinHttpConnect(session,host,443,0);}
         if(connection)request=WinHttpOpenRequest(connection,L"GET",path,NULL,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE);
         if(request){
@@ -164,6 +184,16 @@ done:
 }
 #endif
 
+#ifndef _WIN32
+typedef struct { unsigned slot; char url[1024]; } badge_job;
+static void badge_done(const uint32_t *pixels,void *context){
+    badge_job *job=context;
+    overlay_lock();badge_image *image=&badge_cache[job->slot];
+    if(!strcmp(image->url,job->url)){image->loading=0;image->ready=pixels!=NULL;if(pixels)memcpy(image->pixels,pixels,sizeof(image->pixels));}
+    overlay_unlock();free(job);
+}
+#endif
+
 /* Called with the overlay lock. Failed downloads remain decorative placeholders. */
 static void request_badge(const char *url){
     if(!url||!*url||strlen(url)>=sizeof(badge_cache[0].url))return;
@@ -177,6 +207,15 @@ static void request_badge(const char *url){
     job->slot=slot;snprintf(job->url,sizeof(job->url),"%s",url);
     HANDLE thread=CreateThread(NULL,0,badge_thread,job,0,NULL);
     if(thread)CloseHandle(thread);else{badge_cache[slot].loading=0;free(job);}
+#else
+    unsigned slot=badge_next++%BADGE_CACHE_SIZE;
+    for(unsigned i=0;i<BADGE_CACHE_SIZE&&badge_cache[slot].loading;i++)slot=(slot+1)%BADGE_CACHE_SIZE;
+    if(badge_cache[slot].loading)return;
+    badge_job *job=calloc(1,sizeof(*job));if(!job)return;
+    memset(&badge_cache[slot],0,sizeof(badge_cache[slot]));snprintf(badge_cache[slot].url,sizeof(badge_cache[slot].url),"%s",url);badge_cache[slot].loading=1;
+    job->slot=slot;snprintf(job->url,sizeof(job->url),"%s",url);
+    /* The download thread takes the overlay lock when it finishes, after this caller has released it. */
+    if(!eh_badge_fetch(job->url,EH_RA_BADGE_SIZE,badge_done,job)){badge_cache[slot].loading=0;free(job);}
 #endif
 }
 static int copy_badge(const char *url,uint32_t *pixels){
@@ -266,6 +305,17 @@ static DWORD WINAPI http_thread(LPVOID param){
 
 static char *copy_text(const char *text){if(!text)return NULL;size_t n=strlen(text)+1;char *c=malloc(n);if(c)memcpy(c,text,n);return c;}
 
+#ifndef _WIN32
+typedef struct{rc_client_server_callback_t callback;void *callback_data;}http_wait;
+/* Runs on the request's thread. No status means the request never completed: rcheevos retries those. */
+static void http_done(int status,const char *body,size_t length,void *context){
+    http_wait *wait=context;rc_api_server_response_t response;memset(&response,0,sizeof(response));
+    response.body=body?body:"";response.body_length=body?length:0;
+    response.http_status_code=status?status:RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+    wait->callback(&response,wait->callback_data);free(wait);
+}
+#endif
+
 static void RC_CCONV server_call(const rc_api_request_t *request,rc_client_server_callback_t callback,void *callback_data,rc_client_t *c){
     (void)c;
     const char *diagnostic=getenv("EMUHALL_DIAGNOSTICS");
@@ -279,6 +329,11 @@ static void RC_CCONV server_call(const rc_api_request_t *request,rc_client_serve
     if(job){job->url=copy_text(request->url);job->post=copy_text(request->post_data);job->content_type=copy_text(request->content_type);job->callback=callback;job->callback_data=callback_data;
         HANDLE thread=CreateThread(NULL,0,http_thread,job,0,NULL);if(thread){CloseHandle(thread);return;}
         free(job->url);free(job->post);free(job->content_type);free(job);}
+#else
+    http_wait *wait=calloc(1,sizeof(*wait));
+    if(wait){wait->callback=callback;wait->callback_data=callback_data;
+        if(eh_http_request(request->url,request->post_data,request->content_type,user_agent,8*1024*1024,http_done,wait))return;
+        free(wait);}
 #endif
     rc_api_server_response_t failed;memset(&failed,0,sizeof(failed));failed.body="";failed.http_status_code=RC_API_SERVER_RESPONSE_CLIENT_ERROR;
     callback(&failed,callback_data);
@@ -335,12 +390,10 @@ int eh_ra_toast(char *out,size_t cap){
     int showing=0;
 #ifdef _WIN32
     if(!client)return 0;
-    EnterCriticalSection(&toast_lock);
 #endif
+    overlay_lock();
     if(toast_text[0]&&clock_ms()<toast_until_ms){snprintf(out,cap,"%s",toast_text);showing=1;}
-#ifdef _WIN32
-    LeaveCriticalSection(&toast_lock);
-#endif
+    overlay_unlock();
     return showing;
 }
 
@@ -523,7 +576,10 @@ static void os_clause(char *out,size_t cap){
     if(symbol){RtlGetVersionFn get;memcpy(&get,&symbol,sizeof(get));if(get(&v)==0){snprintf(out,cap,"Windows %lu.%lu",v.dwMajorVersion,v.dwMinorVersion);return;}}
     snprintf(out,cap,"Windows");
 #else
-    snprintf(out,cap,"Unknown");
+    /* "Linux 6.8": the kernel's major and minor version. */
+    struct utsname name;
+    if(uname(&name)==0){unsigned major=0,minor=0;if(sscanf(name.release,"%u.%u",&major,&minor)==2){snprintf(out,cap,"%.24s %u.%u",name.sysname,major,minor);return;}snprintf(out,cap,"%.24s",name.sysname);return;}
+    snprintf(out,cap,"Linux");
 #endif
 }
 
@@ -558,7 +614,7 @@ int eh_ra_start(const char *args,const char *path,const void *data,size_t size,v
     char clause[64]="";rc_client_get_user_agent_clause(client,clause,sizeof(clause));
     char os[48];os_clause(os,sizeof(os));
     /* RetroAchievements' format: EmulatorName/version (OS version) core/version, then the rcheevos clause. */
-    snprintf(user_agent,sizeof(user_agent),"EmuHall/1.0.2 (%s) %s %s",os,core_clause[0]?core_clause:"unknown/0",clause);
+    snprintf(user_agent,sizeof(user_agent),"EmuHall/1.1.0 (%s) %s %s",os,core_clause[0]?core_clause:"unknown/0",clause);
     rc_client_set_event_handler(client,on_event);
     rc_client_set_allow_background_memory_reads(client,0); /* Memory is read only between frames, on this thread. */
     rc_client_set_hardcore_enabled(client,hardcore);

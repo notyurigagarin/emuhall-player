@@ -1,4 +1,6 @@
 mod content_identity;
+#[cfg(not(windows))]
+mod http;
 mod netplay;
 mod runtime;
 use std::ffi::{c_char, c_int, CString};
@@ -22,6 +24,7 @@ extern "C" {
     fn eh_pad_gestures() -> u32;
     fn eh_desktop_smoke() -> c_int;
     fn eh_shader_smoke() -> c_int;
+    fn eh_vk_count_devices() -> c_int;
     fn eh_pad_init() -> c_int;
     fn eh_pad_probe();
     fn eh_pad_shutdown();
@@ -37,6 +40,23 @@ extern "C" {
 }
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // One public, read-only request and one badge download through the same code games use (support diagnostic).
+    #[cfg(not(windows))]
+    if args.len() == 2 && args[1] == "--check-retroachievements" {
+        let report = http::self_check();
+        println!("{report}");
+        std::process::exit(if report["ok"] == true { 0 } else { 1 });
+    }
+    // Graphics cards with Vulkan 1.1 (the launcher's Automatic renderer choice; CPU drivers are listed on stderr but
+    // not counted).
+    if args.len() == 2 && args[1] == "--check-vulkan" {
+        let devices = unsafe { eh_vk_count_devices() };
+        println!(
+            "{}",
+            serde_json::json!({"devices": devices.max(0), "loader": devices >= 0})
+        );
+        return;
+    }
     if args.len() == 4 && args[1] == "--identify-n64" {
         let result = (|| -> anyhow::Result<serde_json::Value> {
             let system = CString::new("n64")?;

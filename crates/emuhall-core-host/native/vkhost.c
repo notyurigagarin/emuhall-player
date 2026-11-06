@@ -34,7 +34,7 @@
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) \
     X(vkResetFences) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkQueueSubmit) X(vkQueueWaitIdle) \
-    X(vkCmdPipelineBarrier) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdCopyImageToBuffer) X(vkCmdClearColorImage) \
+    X(vkCmdPipelineBarrier) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdCopyImageToBuffer) X(vkCmdClearColorImage) X(vkCmdCopyBufferToImage) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) \
     X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) \
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
@@ -80,6 +80,15 @@ static VkFormat chain_format;static VkExtent2D chain_extent;static VkPresentMode
 #ifdef _WIN32
 static HWND window;
 #endif
+/* The player's overlay (achievement pop-ups, challenge and progress indicators, notices): a bitmap the size of the game
+   picture whose pixels are either opaque or fully transparent. Each frame its opaque runs, one per row segment, are
+   copied into the window image after the game's frame. Each frame in flight has its own staging buffer, rewritten only
+   after that frame's fence has passed, so the GPU never reads a buffer while it changes. */
+#define MAX_OVERLAY_RUNS 8192
+static uint32_t *overlay_copy;static unsigned overlay_w,overlay_h,overlay_generation;
+static VkBufferImageCopy overlay_runs[MAX_OVERLAY_RUNS],overlay_regions[MAX_OVERLAY_RUNS];static uint32_t overlay_run_count;
+static VkBuffer overlay_buffer[FRAMES];static VkDeviceMemory overlay_memory[FRAMES];static void *overlay_map[FRAMES];
+static VkDeviceSize overlay_size[FRAMES];static unsigned overlay_slot_generation[FRAMES];
 
 static void lock_queue(void *handle){(void)handle;if(!lock_ready)return;
 #ifdef _WIN32
@@ -306,6 +315,56 @@ static int end_frame(VkSemaphore wait_acquired,VkSemaphore signal_rendered){
     submitted[frame]=1;
     return 1;
 }
+static void overlay_take(const uint32_t *pixels,unsigned w,unsigned h){
+    size_t n=(size_t)w*h;
+    if(!overlay_copy||overlay_w!=w||overlay_h!=h){free(overlay_copy);overlay_copy=malloc(n*4);overlay_w=overlay_copy?w:0;overlay_h=overlay_copy?h:0;}
+    overlay_run_count=0;overlay_generation++;
+    if(!overlay_copy)return;
+    memcpy(overlay_copy,pixels,n*4);
+    for(unsigned y=0;y<h;y++){
+        const uint32_t *row=pixels+(size_t)y*w;unsigned x=0;
+        while(x<w){
+            while(x<w&&!(row[x]>>24))x++;
+            unsigned start=x;while(x<w&&(row[x]>>24))x++;
+            if(x>start){
+                if(overlay_run_count==MAX_OVERLAY_RUNS)return;
+                VkBufferImageCopy *r=&overlay_runs[overlay_run_count++];memset(r,0,sizeof(*r));
+                r->bufferOffset=((VkDeviceSize)y*w+start)*4;r->imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;r->imageSubresource.layerCount=1;
+                r->imageOffset.x=(int32_t)start;r->imageOffset.y=(int32_t)y;r->imageExtent.width=x-start;r->imageExtent.height=1;r->imageExtent.depth=1;
+            }
+        }
+    }
+}
+/* Records the overlay copy into the window image (in TRANSFER_DST) at the picture's position. A failure to set up the
+   staging buffer only leaves the overlay out. */
+static void overlay_record(VkCommandBuffer c,VkImage target,int x,int y){
+    if(!overlay_run_count||!overlay_copy)return;
+    int swap=chain_format==VK_FORMAT_R8G8B8A8_UNORM||chain_format==VK_FORMAT_R8G8B8A8_SRGB;
+    if(!swap&&chain_format!=VK_FORMAT_B8G8R8A8_UNORM&&chain_format!=VK_FORMAT_B8G8R8A8_SRGB)return;
+    uint32_t slot=frame;VkDeviceSize size=(VkDeviceSize)overlay_w*overlay_h*4;
+    if(!overlay_buffer[slot]||overlay_size[slot]<size){
+        if(overlay_buffer[slot]){p_vkUnmapMemory(device,overlay_memory[slot]);p_vkDestroyBuffer(device,overlay_buffer[slot],NULL);p_vkFreeMemory(device,overlay_memory[slot],NULL);overlay_buffer[slot]=VK_NULL_HANDLE;overlay_size[slot]=0;}
+        VkBufferCreateInfo bci;memset(&bci,0,sizeof(bci));bci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;bci.size=size;bci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if(p_vkCreateBuffer(device,&bci,NULL,&overlay_buffer[slot])!=VK_SUCCESS){overlay_buffer[slot]=VK_NULL_HANDLE;return;}
+        VkMemoryRequirements req;p_vkGetBufferMemoryRequirements(device,overlay_buffer[slot],&req);
+        int type=memory_type(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryAllocateInfo ai;memset(&ai,0,sizeof(ai));ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=(uint32_t)type;
+        if(type<0||p_vkAllocateMemory(device,&ai,NULL,&overlay_memory[slot])!=VK_SUCCESS){p_vkDestroyBuffer(device,overlay_buffer[slot],NULL);overlay_buffer[slot]=VK_NULL_HANDLE;return;}
+        if(p_vkBindBufferMemory(device,overlay_buffer[slot],overlay_memory[slot],0)!=VK_SUCCESS||p_vkMapMemory(device,overlay_memory[slot],0,VK_WHOLE_SIZE,0,&overlay_map[slot])!=VK_SUCCESS){
+            p_vkDestroyBuffer(device,overlay_buffer[slot],NULL);p_vkFreeMemory(device,overlay_memory[slot],NULL);overlay_buffer[slot]=VK_NULL_HANDLE;return;
+        }
+        overlay_size[slot]=size;overlay_slot_generation[slot]=overlay_generation-1;
+    }
+    if(overlay_slot_generation[slot]!=overlay_generation){
+        uint32_t *dst=overlay_map[slot];size_t n=(size_t)overlay_w*overlay_h;
+        if(swap){for(size_t i=0;i<n;i++){uint32_t p=overlay_copy[i];dst[i]=(p&0xff00ff00u)|((p>>16)&0xffu)|((p&0xffu)<<16);}}
+        else memcpy(dst,overlay_copy,n*4);
+        overlay_slot_generation[slot]=overlay_generation;
+    }
+    for(uint32_t i=0;i<overlay_run_count;i++){overlay_regions[i]=overlay_runs[i];overlay_regions[i].imageOffset.x+=x;overlay_regions[i].imageOffset.y+=y;}
+    barrier(c,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+    p_vkCmdCopyBufferToImage(c,overlay_buffer[slot],target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,overlay_run_count,overlay_regions);
+}
 static int ensure_last(unsigned w,unsigned h,VkFormat format){
     if(last&&last_w==w&&last_h==h&&last_format==format)return 1;
     if(last){if(queue_idle()!=VK_SUCCESS)return 0;p_vkDestroyImage(device,last,NULL);p_vkFreeMemory(device,last_memory,NULL);last=VK_NULL_HANDLE;}
@@ -422,8 +481,10 @@ int eh_vk_present_attach(void *win){
     fprintf(stderr,"Vulkan: frames are shown on the graphics card (%s)\n",chain_mode==VK_PRESENT_MODE_MAILBOX_KHR?"mailbox":chain_mode==VK_PRESENT_MODE_IMMEDIATE_KHR?"immediate":"fifo");
     return 1;
 }
-int eh_vk_present(unsigned frame_w,unsigned frame_h,int smooth,int integer_scale,int *view_x,int *view_y,int *view_w,int *view_h){
+int eh_vk_present(unsigned frame_w,unsigned frame_h,int smooth,int integer_scale,const uint32_t *overlay,unsigned overlay_width,unsigned overlay_height,int overlay_changed,int *view_x,int *view_y,int *view_w,int *view_h){
     if(lost)return -1;
+    if(!overlay){if(overlay_run_count){overlay_run_count=0;overlay_generation++;}}
+    else if(overlay_changed||overlay_width!=overlay_w||overlay_height!=overlay_h)overlay_take(overlay,overlay_width,overlay_height);
     if(!surface)return 0;
     if(!have_image)return 1;
     have_image=0;
@@ -468,6 +529,8 @@ int eh_vk_present(unsigned frame_w,unsigned frame_h,int smooth,int integer_scale
     blit.srcOffsets[1].x=(int32_t)frame_w;blit.srcOffsets[1].y=(int32_t)frame_h;blit.srcOffsets[1].z=1;
     blit.dstOffsets[0].x=x;blit.dstOffsets[0].y=y;blit.dstOffsets[1].x=x+dw;blit.dstOffsets[1].y=y+dh;blit.dstOffsets[1].z=1;
     p_vkCmdBlitImage(c,last,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,smooth?VK_FILTER_LINEAR:VK_FILTER_NEAREST);
+    /* The overlay is drawn for the picture size of the previous frames; it shows once it matches this one. */
+    if(overlay&&overlay_w==(unsigned)dw&&overlay_h==(unsigned)dh)overlay_record(c,target,x,y);
     barrier(c,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_ACCESS_TRANSFER_WRITE_BIT,0,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if(!end_frame(acquired[frame],rendered[frame]))return -1;
     VkPresentInfoKHR pi;memset(&pi,0,sizeof(pi));pi.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -512,6 +575,7 @@ int eh_vk_capture(uint32_t *out,unsigned *out_w,unsigned *out_h){
 }
 int eh_vk_lost(void){return lost;}
 void eh_vk_destroy(void){
+    free(overlay_copy);overlay_copy=NULL;overlay_w=overlay_h=0;overlay_run_count=0;
     if(device&&lost){
         /* A lost device can block every call that waits on it, the engine's included: leave it to the process exit. */
         device=VK_NULL_HANDLE;instance=VK_NULL_HANDLE;
@@ -524,6 +588,8 @@ void eh_vk_destroy(void){
         for(int i=0;i<FRAMES;i++){
             if(readback[i]){p_vkUnmapMemory(device,readback_memory[i]);p_vkDestroyBuffer(device,readback[i],NULL);p_vkFreeMemory(device,readback_memory[i],NULL);readback[i]=VK_NULL_HANDLE;}
             readback_size[i]=0;readback_pending[i]=0;submitted[i]=0;
+            if(overlay_buffer[i]){p_vkUnmapMemory(device,overlay_memory[i]);p_vkDestroyBuffer(device,overlay_buffer[i],NULL);p_vkFreeMemory(device,overlay_memory[i],NULL);overlay_buffer[i]=VK_NULL_HANDLE;}
+            overlay_size[i]=0;
             if(fence[i]){p_vkDestroyFence(device,fence[i],NULL);fence[i]=VK_NULL_HANDLE;}
             if(acquired[i]){p_vkDestroySemaphore(device,acquired[i],NULL);acquired[i]=VK_NULL_HANDLE;}
             if(rendered[i]){p_vkDestroySemaphore(device,rendered[i],NULL);rendered[i]=VK_NULL_HANDLE;}
@@ -536,4 +602,42 @@ void eh_vk_destroy(void){
     if(instance){p_vkDestroyInstance(instance,NULL);instance=VK_NULL_HANDLE;}
     have_image=0;frame=0;negotiation=NULL;
     /* The loader stays loaded: the engine may keep function pointers until it is unloaded. */
+}
+
+/* For the launcher's Automatic renderer choice (`emuhall-core-host --check-vulkan`): a loader without any driver (Arch's
+   mesa installs none) fails instance creation, and a driver may list no device for this computer. Run on its own. */
+int eh_vk_count_devices(void){
+    PFN_vkGetInstanceProcAddr gip=NULL;
+#ifdef _WIN32
+    HMODULE lib=LoadLibraryExW(L"vulkan-1.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(lib){FARPROC f=GetProcAddress(lib,"vkGetInstanceProcAddr");memcpy(&gip,&f,sizeof(f));}
+#else
+    void *lib=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!lib)lib=dlopen("libvulkan.so",RTLD_NOW|RTLD_LOCAL);
+    if(lib){void *f=dlsym(lib,"vkGetInstanceProcAddr");memcpy(&gip,&f,sizeof(f));}
+#endif
+    if(!gip){fprintf(stderr,"Vulkan: no loader\n");return -1;}
+    PFN_vkCreateInstance create;{PFN_vkVoidFunction f=gip(VK_NULL_HANDLE,"vkCreateInstance");memcpy(&create,&f,sizeof(f));}
+    if(!create)return -1;
+    VkApplicationInfo app;memset(&app,0,sizeof(app));app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName="EmuHall";app.pEngineName="EmuHall";app.apiVersion=VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici;memset(&ici,0,sizeof(ici));ici.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;ici.pApplicationInfo=&app;
+    VkInstance probe;VkResult r=create(&ici,NULL,&probe);
+    if(r!=VK_SUCCESS){fprintf(stderr,"Vulkan: no instance (%d)\n",(int)r);return 0;}
+    PFN_vkEnumeratePhysicalDevices enumerate;PFN_vkGetPhysicalDeviceProperties properties;PFN_vkDestroyInstance destroy;
+    {PFN_vkVoidFunction f=gip(probe,"vkEnumeratePhysicalDevices");memcpy(&enumerate,&f,sizeof(f));}
+    {PFN_vkVoidFunction f=gip(probe,"vkGetPhysicalDeviceProperties");memcpy(&properties,&f,sizeof(f));}
+    {PFN_vkVoidFunction f=gip(probe,"vkDestroyInstance");memcpy(&destroy,&f,sizeof(f));}
+    int found=0;
+    if(enumerate&&properties){
+        VkPhysicalDevice gpus[16];uint32_t count=16;
+        r=enumerate(probe,&count,gpus);
+        for(uint32_t i=0;(r==VK_SUCCESS||r==VK_INCOMPLETE)&&i<count;i++){
+            VkPhysicalDeviceProperties p;properties(gpus[i],&p);
+            fprintf(stderr,"Vulkan device: %s (type %d, Vulkan %u.%u)\n",p.deviceName,(int)p.deviceType,VK_VERSION_MAJOR(p.apiVersion),VK_VERSION_MINOR(p.apiVersion));
+            /* CPU drivers (lavapipe, which Ubuntu installs by default) do not count: OpenGL on the graphics card wins. */
+            if(p.apiVersion>=VK_API_VERSION_1_1&&p.deviceType!=VK_PHYSICAL_DEVICE_TYPE_CPU)found++;
+        }
+    }
+    if(destroy)destroy(probe,NULL);
+    return found;
 }

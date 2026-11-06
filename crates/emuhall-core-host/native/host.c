@@ -130,6 +130,18 @@ static pthread_mutex_t queue_lock=PTHREAD_MUTEX_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&queue_lock)
 #define UNLOCK() pthread_mutex_unlock(&queue_lock)
 static void nap(unsigned ms){struct timespec t={(time_t)(ms/1000),(long)(ms%1000)*1000000L};while(nanosleep(&t,&t)&&errno==EINTR){}}
+/* Frame pacing sleeps until the frame's deadline on CLOCK_MONOTONIC, the clock now_ms() reads. Not whole milliseconds
+   (truncating 16.7 ms to 16 made frames uneven), and not SDL's clock: SDL reads CLOCK_MONOTONIC_RAW, which the kernel
+   does not correct, and on machines with a poorly calibrated timer (measured in WSL: 5.6% fast) games ran too fast. */
+/* EMUHALL_PACE_DEBUG=1: once a second, where each frame's time went (stderr). */
+static int pace_debug;static unsigned pace_frames,pace_late,pace_resets;static double pace_present_ms,pace_sleep_ms,pace_since;
+static double now_ms(void);
+static void sleep_until_ms(double deadline_ms){
+    if(deadline_ms<=now_ms())return;
+    struct timespec t;t.tv_sec=(time_t)(deadline_ms/1000.0);t.tv_nsec=(long)((deadline_ms-t.tv_sec*1000.0)*1000000.0);
+    if(t.tv_nsec<0)t.tv_nsec=0;if(t.tv_nsec>999999999L)t.tv_nsec=999999999L;
+    while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL)==EINTR){}
+}
 /* The system's monotonic clock, so timing works headless and before (or without) SDL. */
 static double now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
 #define SEP "/"
@@ -279,7 +291,28 @@ static DWORD WINAPI watchdog_thread(LPVOID unused){(void)unused;watchdog_loop();
 #else
 static void *watchdog_thread(void *unused){(void)unused;watchdog_loop();return NULL;}
 #endif
-static void read_commands(void){char line[8192];while(fgets(line,sizeof(line),stdin)){line[strcspn(line,"\r\n")]=0;char *text=line;if(!memcmp(text,"\xEF\xBB\xBF",3))text+=3; /* Tolerate a UTF-8 byte order mark. */if(text[0]){if(!strcmp(text,"quit"))quit_asked=1;queue_push(text);}}quit_asked=1;queue_push("quit"); /* The launcher went away. */}
+static void take_command(char *line){line[strcspn(line,"\r\n")]=0;char *text=line;if(!memcmp(text,"\xEF\xBB\xBF",3))text+=3; /* Tolerate a UTF-8 byte order mark. */if(text[0]){if(!strcmp(text,"quit"))quit_asked=1;queue_push(text);}}
+static void read_commands(void){
+    char line[8192];
+#ifdef _WIN32
+    while(fgets(line,sizeof(line),stdin))take_command(line);
+#else
+    /* read(2), not stdio: a thread waiting in fgets holds stdin's lock, and exit() on glibc 2.36 and later flushes every
+       stream under its lock, so every game's player hung at exit until the watchdog closed it (all but Ubuntu 22.04). */
+    char chunk[4096];size_t used=0;
+    for(;;){
+        ssize_t n=read(0,chunk,sizeof(chunk));
+        if(n<0&&errno==EINTR)continue;
+        if(n<=0)break;
+        for(ssize_t i=0;i<n;i++){
+            if(chunk[i]=='\n'){line[used]=0;take_command(line);used=0;}
+            else if(used<sizeof(line)-1)line[used++]=chunk[i];
+        }
+    }
+    if(used){line[used]=0;take_command(line);}
+#endif
+    quit_asked=1;queue_push("quit"); /* The launcher went away. */
+}
 #ifdef _WIN32
 static DWORD WINAPI command_reader(LPVOID unused){(void)unused;read_commands();return 0;}
 #else
@@ -473,6 +506,12 @@ static void video(const void *data,unsigned width,unsigned height,size_t pitch){
         return;
     }
     size_t bpp=pixel_format==RETRO_PIXEL_FORMAT_XRGB8888?4:2;
+    /* An empty hardware frame while the engine's output starts (the PS2 engine's first frame on OpenGL is 0x0): nothing
+       to show yet. It ended the game whenever it arrived. */
+    if(data==RETRO_HW_FRAME_BUFFER_VALID&&hw_active&&(!width||!height)){
+        if(video_frames)frame_ready=1;
+        return;
+    }
     if(data==RETRO_HW_FRAME_BUFFER_VALID&&hw_active&&gpu_present){
         if(width&&height&&width<=frame_cap_w&&height<=frame_cap_h&&gpu_frame(width,height)<0){callback_error="Graphics presentation failed; see renderer details above";fault=1;quit=1;}
         return;
@@ -990,8 +1029,8 @@ static int gpu_frame(unsigned width,unsigned height){
     EnterCriticalSection(&overlay_lock);
     /* Never wait for the display here: this runs inside the engine's frame, and the PS2 CPU waits with it. The flip
        model shows the newest frame at each refresh without tearing; the sound card paces emulation. */
-    /* The Vulkan path has no overlay yet: achievements and notices are not drawn over Vulkan frames. */
-    int shown=hw_vk?eh_vk_present(width,height,smooth_scaling,integer_scaling,&vx,&vy,&vw,&vh)
+    /* Achievements and notices are drawn over the picture on both GPU paths. */
+    int shown=hw_vk?eh_vk_present(width,height,smooth_scaling,integer_scaling,overlay_has?overlay_pixels:NULL,overlay_w,overlay_h,overlay_changed,&vx,&vy,&vw,&vh)
         :eh_d3d_present(width,height,atomic_load(&display_aspect),0,smooth_scaling,integer_scaling,overlay_has?overlay_pixels:NULL,overlay_w,overlay_h,overlay_changed,&vx,&vy,&vw,&vh);
     overlay_changed=0;
     LeaveCriticalSection(&overlay_lock);
@@ -1135,6 +1174,7 @@ int eh_run(const char *core,const char *content,const char *save,unsigned limit,
 #else
     (void)parent;
     void *library=dlopen(core,RTLD_NOW|RTLD_LOCAL);
+    if(!library){const char *why=dlerror();fprintf(stderr,"Engine library: %s\n",why?why:"unknown error");}
 #define LOAD(ret,name,args) p_##name=(name##_fn)dlsym(library,#name);if(!p_##name){fprintf(stderr,"Missing required core symbol: %s\n",#name);goto cleanup;}
 
 #endif
@@ -1284,7 +1324,7 @@ int eh_run(const char *core,const char *content,const char *save,unsigned limit,
 #endif
 #ifndef _WIN32
     if(show_window){if(!eh_desktop_open(av.timing.sample_rate,0))goto cleanup;eh_pad_init();display_frame=malloc((size_t)frame_cap_w*frame_cap_h*4u);if(!display_frame)goto cleanup;}
-    double deadline=show_window?eh_desktop_now():0;
+    double deadline=show_window?now_ms():0;pace_debug=getenv("EMUHALL_PACE_DEBUG")!=NULL;
 #endif
     temporal_supported=getenv("EMUHALL_TEMPORAL_SUPPORTED")&&!strcmp(getenv("EMUHALL_TEMPORAL_SUPPORTED"),"1")&&!hw_active&&!netplay_active;
     runahead_supported=temporal_supported&&(!getenv("EMUHALL_RUNAHEAD_SUPPORTED")||!strcmp(getenv("EMUHALL_RUNAHEAD_SUPPORTED"),"1"));
@@ -1322,8 +1362,9 @@ int eh_run(const char *core,const char *content,const char *save,unsigned limit,
 #endif
         if(quit)break;
         if(!paused&&!launch_wait){
+            double t0=now_ms();
 #ifdef _WIN32
-            double t0=now_ms();size_t audio_before_run=audio_frames;
+            size_t audio_before_run=audio_frames;
 #endif
             if(netplay_active){
                 uint16_t local=0;
@@ -1366,7 +1407,11 @@ int eh_run(const char *core,const char *content,const char *save,unsigned limit,
                 }
             }
 #ifndef _WIN32
+            /* Emulation time per frame (including a GPU engine's read-back), for the session summary. */
+            {double run_ms=now_ms()-t0;emulate_total_ms+=run_ms;if(run_ms>emulate_worst_ms)emulate_worst_ms=run_ms;}
+            {double p0=now_ms();
             if(show_window&&frame_ready){memcpy(display_frame,framebuffer,(size_t)frame_width*frame_height*4);presentation_filter(display_frame,frame_width,frame_height);if(!eh_desktop_video(display_frame,frame_width,frame_height,integer_scaling,smooth_scaling)){fault=1;quit=1;}frame_ready=0;}
+            pace_present_ms+=now_ms()-p0;}
 #endif
 #ifdef _WIN32
             double t1=now_ms();
@@ -1585,7 +1630,8 @@ int eh_run(const char *core,const char *content,const char *save,unsigned limit,
             if(ahead>0.001)Sleep((DWORD)(ahead*1000));else if(ahead<-0.25){paced=0;start=now;} /* Fell far behind: don't sprint to catch up. */}
 #else
         (void)paced; /* the Windows timer pacing counts frames; this pacing keeps a deadline */
-        if(show_window){double now=eh_desktop_now();if(resync||deadline<now-250)deadline=now;deadline+=1000.0/av.timing.fps/(fast_forward?fast_forward_speed/100.0:1.0);double ahead=deadline-now;if(ahead>=1)nap((unsigned)ahead);}
+        if(show_window){double now=now_ms();if(resync||deadline<now-250){deadline=now;pace_resets++;}deadline+=1000.0/av.timing.fps/(fast_forward?fast_forward_speed/100.0:1.0);if(deadline<now)pace_late++;sleep_until_ms(deadline);pace_sleep_ms+=now_ms()-now;pace_frames++;
+            if(pace_debug&&now-pace_since>=1000){fprintf(stderr,"pace: %u frames, present %.2f ms, sleep %.2f ms, late %u, resets %u\n",pace_frames,pace_present_ms/pace_frames,pace_sleep_ms/pace_frames,pace_late,pace_resets);pace_since=now;pace_frames=pace_late=pace_resets=0;pace_present_ms=pace_sleep_ms=0;}}
 #endif
     }
 #ifdef _WIN32

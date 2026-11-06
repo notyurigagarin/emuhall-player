@@ -17,6 +17,11 @@ sha2.workspace = true
 uuid.workspace = true
 native-tls = "0.2"
 
+# RetroAchievements requests and badge images where there is no WinHTTP/WIC (Linux); both already in the tree.
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+png = "0.18"
+
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = "3"
